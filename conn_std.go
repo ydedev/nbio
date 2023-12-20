@@ -23,8 +23,8 @@ type Conn struct {
 	p *poller
 
 	hash int
-
-	mux sync.Mutex
+	Unix int64
+	mux  sync.Mutex
 
 	conn    net.Conn
 	connUDP *udpConn
