@@ -27,30 +27,34 @@ const (
 	MaxInt = int64(int(MaxUint >> 1))
 )
 
+type ParserCloser interface {
+	UnderlayerConn() net.Conn
+	Parse(data []byte) error
+	CloseAndClean(err error)
+}
+
 // Parser .
 type Parser struct {
 	mux sync.Mutex
 
-	cache []byte
+	// bytesCached for half packet.
+	bytesCached []byte
 
-	readLimit int
-
-	errClose error
+	// errClose error
 
 	onClose func(p *Parser, err error)
 
-	Processor Processor
-
-	Reader interface {
-		Read(p *Parser, data []byte) error
-		CloseAndClean(err error)
-	}
+	ParserCloser ParserCloser
 
 	Engine *Engine
 
+	// Underlayer Conn.
 	Conn net.Conn
 
+	// used to call message handler when got a full Request/Response.
 	Execute func(f func()) bool
+
+	Processor Processor
 
 	// http fields
 	proto         string
@@ -69,6 +73,10 @@ type Parser struct {
 	headerExists bool
 }
 
+func (p *Parser) UnderlayerConn() net.Conn {
+	return p.Conn
+}
+
 func (p *Parser) nextState(state int8) {
 	switch p.state {
 	case stateClose:
@@ -77,13 +85,13 @@ func (p *Parser) nextState(state int8) {
 	}
 }
 
-// OnClose .
+// OnClose registers callback for closing.
 func (p *Parser) OnClose(h func(p *Parser, err error)) {
 	p.onClose = h
 }
 
-// Close .
-func (p *Parser) Close(err error) {
+// CloseAndClean closes the underlayer connection and cleans up related.
+func (p *Parser) CloseAndClean(err error) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 
@@ -93,16 +101,16 @@ func (p *Parser) Close(err error) {
 
 	p.state = stateClose
 
-	p.errClose = err
+	// p.errClose = err
 
-	if p.Reader != nil {
-		p.Reader.CloseAndClean(p.errClose)
-	}
+	// if p.ReadCloser != nil {
+	// 	p.ReadCloser.CloseWithError(p.errClose)
+	// }
 	if p.Processor != nil {
-		p.Processor.Close(p, p.errClose)
+		p.Processor.Close(p, err)
 	}
-	if len(p.cache) > 0 {
-		mempool.Free(p.cache)
+	if len(p.bytesCached) > 0 {
+		mempool.Free(p.bytesCached)
 	}
 	if p.onClose != nil {
 		p.onClose(p, err)
@@ -123,8 +131,10 @@ func parseAndValidateChunkSize(originalStr string) (int, error) {
 	return int(chunkSize), nil
 }
 
-// Read .
-func (p *Parser) Read(data []byte) error {
+// Parse parses data bytes and calls HTTP handler when full request received.
+// If the connection is upgraded, it passes the data bytes to the ParserCloser
+// and doesn't parse them itself any more.
+func (p *Parser) Parse(data []byte) error {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 
@@ -137,32 +147,33 @@ func (p *Parser) Read(data []byte) error {
 	}
 
 	var start = 0
-	var offset = len(p.cache)
+	var offset = len(p.bytesCached)
 	if offset > 0 {
-		if offset+len(data) > p.readLimit {
+		if p.Engine.ReadLimit > 0 && offset+len(data) > p.Engine.ReadLimit {
 			return ErrTooLong
 		}
-		p.cache = mempool.Append(p.cache, data...)
-		data = p.cache
+		p.bytesCached = mempool.Append(p.bytesCached, data...)
+		data = p.bytesCached
 	}
 
 UPGRADER:
-	if p.Reader != nil {
+	if p.ParserCloser != nil {
 		udata := data
 		if start > 0 {
 			udata = data[start:]
 		}
-		err := p.Reader.Read(p, udata)
-		if p.cache != nil {
-			mempool.Free(p.cache)
-			p.cache = nil
+		err := p.ParserCloser.Parse(udata)
+		if p.bytesCached != nil {
+			mempool.Free(p.bytesCached)
+			p.bytesCached = nil
 		}
 		return err
 	}
 
 	var c byte
 	for i := offset; i < len(data); i++ {
-		if p.Reader != nil {
+		if p.ParserCloser != nil {
+			p.Processor.Clean(p)
 			goto UPGRADER
 		}
 		c = data[i]
@@ -182,7 +193,7 @@ UPGRADER:
 				if !isValidMethod(method) {
 					return ErrInvalidMethod
 				}
-				p.Processor.OnMethod(method)
+				p.Processor.OnMethod(p, method)
 				start = i + 1
 				p.nextState(statePathBefore)
 				continue
@@ -205,7 +216,7 @@ UPGRADER:
 		case statePath:
 			if c == ' ' {
 				var uri = string(data[start:i])
-				if err := p.Processor.OnURL(uri); err != nil {
+				if err := p.Processor.OnURL(p, uri); err != nil {
 					return err
 				}
 				start = i + 1
@@ -226,7 +237,7 @@ UPGRADER:
 				if p.proto == "" {
 					p.proto = string(data[start:i])
 				}
-				if err := p.Processor.OnProto(p.proto); err != nil {
+				if err := p.Processor.OnProto(p, p.proto); err != nil {
 					p.proto = ""
 					return err
 				}
@@ -246,7 +257,7 @@ UPGRADER:
 				if p.proto == "" {
 					p.proto = string(data[start:i])
 				}
-				if err := p.Processor.OnProto(p.proto); err != nil {
+				if err := p.Processor.OnProto(p, p.proto); err != nil {
 					p.proto = ""
 					return err
 				}
@@ -299,7 +310,7 @@ UPGRADER:
 				if p.status == "" {
 					p.status = string(data[start:i])
 				}
-				p.Processor.OnStatus(p.statusCode, p.status)
+				p.Processor.OnStatus(p, p.statusCode, p.status)
 				p.statusCode = 0
 				p.status = ""
 				p.nextState(stateStatusLF)
@@ -340,7 +351,7 @@ UPGRADER:
 					return err
 				}
 
-				p.Processor.OnContentLength(p.contentLength)
+				p.Processor.OnContentLength(p, p.contentLength)
 				err = p.parseTrailer()
 				if err != nil {
 					return err
@@ -393,7 +404,7 @@ UPGRADER:
 				default:
 				}
 
-				p.Processor.OnHeader(p.headerKey, p.headerValue)
+				p.Processor.OnHeader(p, p.headerKey, p.headerValue)
 				p.headerKey = ""
 				p.headerValue = ""
 
@@ -423,7 +434,7 @@ UPGRADER:
 				default:
 				}
 
-				p.Processor.OnHeader(p.headerKey, p.headerValue)
+				p.Processor.OnHeader(p, p.headerKey, p.headerValue)
 				p.headerKey = ""
 				p.headerValue = ""
 
@@ -454,7 +465,10 @@ UPGRADER:
 			cl := p.contentLength
 			left := len(data) - start
 			if left >= cl {
-				p.Processor.OnBody(data[start : start+cl])
+				err := p.Processor.OnBody(p, data[start:start+cl])
+				if err != nil {
+					return err
+				}
 				p.handleMessage()
 				start += cl
 				i = start - 1
@@ -521,7 +535,10 @@ UPGRADER:
 			cl := p.chunkSize
 			left := len(data) - start
 			if left >= cl {
-				p.Processor.OnBody(data[start : start+cl])
+				err := p.Processor.OnBody(p, data[start:start+cl])
+				if err != nil {
+					return err
+				}
 				start += cl
 				i = start - 1
 				p.nextState(stateBodyChunkDataCR)
@@ -588,7 +605,7 @@ UPGRADER:
 				if p.headerValue == "" {
 					p.headerValue = string(data[start:i])
 				}
-				p.Processor.OnTrailerHeader(p.headerKey, p.headerValue)
+				p.Processor.OnTrailerHeader(p, p.headerKey, p.headerValue)
 				p.headerKey = ""
 				p.headerValue = ""
 
@@ -616,7 +633,7 @@ UPGRADER:
 				}
 				delete(p.trailer, p.headerKey)
 
-				p.Processor.OnTrailerHeader(p.headerKey, p.headerValue)
+				p.Processor.OnTrailerHeader(p, p.headerKey, p.headerValue)
 				start = i + 1
 				p.headerKey = ""
 				p.headerValue = ""
@@ -646,18 +663,18 @@ UPGRADER:
 Exit:
 	left := len(data) - start
 	if left > 0 {
-		if p.cache == nil {
-			p.cache = mempool.Malloc(left)
-			copy(p.cache, data[start:])
+		if p.bytesCached == nil {
+			p.bytesCached = mempool.Malloc(left)
+			copy(p.bytesCached, data[start:])
 		} else if start > 0 {
-			oldCache := p.cache
-			p.cache = mempool.Malloc(left)
-			copy(p.cache, data[start:])
-			mempool.Free(oldCache)
+			oldbytesCached := p.bytesCached
+			p.bytesCached = mempool.Malloc(left)
+			copy(p.bytesCached, data[start:])
+			mempool.Free(oldbytesCached)
 		}
-	} else if len(p.cache) > 0 {
-		mempool.Free(p.cache)
-		p.cache = nil
+	} else if len(p.bytesCached) > 0 {
+		mempool.Free(p.bytesCached)
+		p.bytesCached = nil
 	}
 
 	return nil
@@ -773,17 +790,14 @@ func (p *Parser) handleMessage() {
 	}
 }
 
-// NewParser .
-func NewParser(processor Processor, isClient bool, readLimit int, executor func(f func()) bool) *Parser {
+// NewParser creates an HTTP parser.
+func NewParser(conn net.Conn, engine *Engine, processor Processor, isClient bool, executor func(f func()) bool) *Parser {
 	if processor == nil {
 		processor = NewEmptyProcessor()
 	}
 	state := stateMethodBefore
 	if isClient {
 		state = stateClientProtoBefore
-	}
-	if readLimit <= 0 {
-		readLimit = DefaultHTTPReadLimit
 	}
 	if executor == nil {
 		executor = func(f func()) bool {
@@ -793,10 +807,11 @@ func NewParser(processor Processor, isClient bool, readLimit int, executor func(
 	}
 	p := &Parser{
 		state:     state,
-		readLimit: readLimit,
 		isClient:  isClient,
-		Execute:   executor,
 		Processor: processor,
+		Conn:      conn,
+		Engine:    engine,
+		Execute:   executor,
 	}
 	return p
 }

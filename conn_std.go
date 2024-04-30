@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lesismal/nbio/timer"
@@ -40,11 +41,13 @@ type Conn struct {
 	// user session.
 	session interface{}
 
-	execList []func()
+	jobList []func()
 
 	cache *bytes.Buffer
 
-	DataHandler func(c *Conn, data []byte)
+	dataHandler func(c *Conn, data []byte)
+
+	onConnected func(c *Conn, err error)
 }
 
 // Hash returns a hashcode.
@@ -69,24 +72,6 @@ func (c *Conn) Read(b []byte) (int, error) {
 	return nread, err
 }
 
-// ReadUDP .
-func (c *Conn) ReadUDP(b []byte) (*Conn, int, error) {
-	if c.closeErr != nil {
-		return c, 0, c.closeErr
-	}
-
-	var reader io.Reader = c.conn
-	if c.cache != nil {
-		reader = c.cache
-	}
-	nread, err := reader.Read(b)
-	if c.closeErr == nil {
-		c.closeErr = err
-	}
-
-	return c, nread, err
-}
-
 func (c *Conn) read(b []byte) (int, error) {
 	var err error
 	var nread int
@@ -104,7 +89,7 @@ func (c *Conn) read(b []byte) (int, error) {
 
 func (c *Conn) readTCP(b []byte) (int, error) {
 	g := c.p.g
-	g.beforeRead(c)
+	// g.beforeRead(c)
 	nread, err := c.conn.Read(b)
 	if c.closeErr == nil {
 		c.closeErr = err
@@ -140,8 +125,8 @@ func (c *Conn) readUDP(b []byte) (int, error) {
 	var dstConn = c
 	if c.typ == ConnTypeUDPServer {
 		uc, ok := c.connUDP.getConn(c.p, rAddr)
-		if g.udpReadTimeout > 0 {
-			uc.SetReadDeadline(time.Now().Add(g.udpReadTimeout))
+		if g.UDPReadTimeout > 0 {
+			uc.SetReadDeadline(time.Now().Add(g.UDPReadTimeout))
 		}
 		if !ok {
 			p := g.pollers[c.Hash()%len(g.pollers)]
@@ -168,24 +153,26 @@ func (c *Conn) readUDP(b []byte) (int, error) {
 
 // Write wraps net.Conn.Write.
 func (c *Conn) Write(b []byte) (int, error) {
+	var n int
 	var err error
-	var nwrite int
 	switch c.typ {
 	case ConnTypeTCP:
-		nwrite, err = c.writeTCP(b)
+		n, err = c.writeTCP(b)
 	case ConnTypeUDPServer:
 	case ConnTypeUDPClientFromDial:
-		nwrite, err = c.writeUDPClientFromDial(b)
+		n, err = c.writeUDPClientFromDial(b)
 	case ConnTypeUDPClientFromRead:
-		nwrite, err = c.writeUDPClientFromRead(b)
+		n, err = c.writeUDPClientFromRead(b)
 	default:
 	}
-	return nwrite, err
+	if c.p.g.onWrittenSize != nil && n > 0 {
+		c.p.g.onWrittenSize(c, b[:n], n)
+	}
+	return n, err
 }
 
 func (c *Conn) writeTCP(b []byte) (int, error) {
-	c.p.g.beforeWrite(c)
-
+	// c.p.g.beforeWrite(c)
 	nwrite, err := c.conn.Write(b)
 	if err != nil {
 		if c.closeErr == nil {
@@ -230,6 +217,18 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 			}
 			c.Close()
 		}
+		if c.p.g.onWrittenSize != nil && nwrite > 0 {
+			total := int(nwrite)
+			for i := 0; total > 0; i++ {
+				if total <= len(in[i]) {
+					c.p.g.onWrittenSize(c, in[i][:total], total)
+					total = 0
+				} else {
+					c.p.g.onWrittenSize(c, in[i], len(in[i]))
+					total -= len(in[i])
+				}
+			}
+		}
 		return int(nwrite), err
 	}
 
@@ -238,6 +237,9 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 		nwrite, err := c.Write(b)
 		if nwrite > 0 {
 			total += nwrite
+		}
+		if c.p.g.onWrittenSize != nil && nwrite > 0 {
+			c.p.g.onWrittenSize(c, b[:nwrite], nwrite)
 		}
 		if err != nil {
 			if c.closeErr == nil {
@@ -435,16 +437,6 @@ func (c *Conn) SetLinger(onoff int32, linger int32) error {
 	return nil
 }
 
-// Session returns user session.
-func (c *Conn) Session() interface{} {
-	return c.session
-}
-
-// SetSession sets user session.
-func (c *Conn) SetSession(session interface{}) {
-	c.session = session
-}
-
 func newConn(conn net.Conn) *Conn {
 	c := &Conn{}
 	addr := conn.LocalAddr().String()
@@ -546,4 +538,13 @@ func (u *udpConn) getConn(p *poller, rAddr *net.UDPAddr) (*Conn, bool) {
 	}
 
 	return c, ok
+}
+
+func (c *Conn) SyscallConn() (syscall.RawConn, error) {
+	if rc, ok := c.conn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	}); ok {
+		return rc.SyscallConn()
+	}
+	return nil, ErrUnsupported
 }

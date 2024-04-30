@@ -2,7 +2,6 @@ module github.com/ydedev/nbio
 
 go 1.16
 
-require (
-	github.com/lesismal/llib v1.1.12
-	golang.org/x/crypto v0.17.0 // indirect
-)
+require github.com/lesismal/llib v1.1.13
+
+retract v1.5.4 // Contains body length parsing bug.

@@ -8,6 +8,7 @@
 package nbio
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,7 +33,6 @@ const (
 )
 
 const (
-	// for build
 	IPPROTO_TCP   = 0
 	TCP_KEEPINTVL = 0
 	TCP_KEEPIDLE  = 0
@@ -61,18 +61,41 @@ type poller struct {
 	eventList []syscall.Kevent_t
 }
 
-func (p *poller) addConn(c *Conn) {
+func (p *poller) addConn(c *Conn) error {
 	fd := c.fd
 	if fd >= len(p.g.connsUnix) {
-		c.closeWithError(fmt.Errorf("too many open files, fd[%d] >= MaxOpenFiles[%d]", fd, len(p.g.connsUnix)))
-		return
+		err := fmt.Errorf("too many open files, fd[%d] >= MaxOpenFiles[%d]",
+			fd,
+			len(p.g.connsUnix))
+		c.closeWithError(err)
+		return err
 	}
 	c.p = p
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
+	} else {
+		p.g.onUDPListen(c)
 	}
 	p.g.connsUnix[fd] = c
 	p.addRead(fd)
+	return nil
+}
+
+func (p *poller) addDialer(c *Conn) error {
+	fd := c.fd
+	if fd >= len(p.g.connsUnix) {
+		err := fmt.Errorf("too many open files, fd[%d] >= MaxOpenFiles[%d]",
+			fd,
+			len(p.g.connsUnix),
+		)
+		c.closeWithError(err)
+		return err
+	}
+	c.p = p
+	p.g.connsUnix[fd] = c
+	c.isWAdded = true
+	p.addReadWrite(fd)
+	return nil
 }
 
 func (p *poller) getConn(fd int) *Conn {
@@ -89,7 +112,7 @@ func (p *poller) deleteConn(c *Conn) {
 		if c == p.g.connsUnix[fd] {
 			p.g.connsUnix[fd] = nil
 		}
-		p.deleteEvent(fd)
+		// p.deleteEvent(fd)
 	}
 
 	if c.typ != ConnTypeUDPServer {
@@ -104,6 +127,7 @@ func (p *poller) trigger() {
 func (p *poller) addRead(fd int) {
 	p.mux.Lock()
 	p.eventList = append(p.eventList, syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_READ})
+	// p.eventList = append(p.eventList, syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_WRITE})
 	p.mux.Unlock()
 	p.trigger()
 }
@@ -122,14 +146,22 @@ func (p *poller) modWrite(fd int) {
 	p.trigger()
 }
 
-func (p *poller) deleteEvent(fd int) {
+func (p *poller) addReadWrite(fd int) {
 	p.mux.Lock()
-	p.eventList = append(p.eventList,
-		syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_READ},
-		syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_WRITE})
+	p.eventList = append(p.eventList, syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_READ})
+	p.eventList = append(p.eventList, syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_WRITE})
 	p.mux.Unlock()
 	p.trigger()
 }
+
+// func (p *poller) deleteEvent(fd int) {
+// 	p.mux.Lock()
+// 	p.eventList = append(p.eventList,
+// 		syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_READ},
+// 		syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_WRITE})
+// 	p.mux.Unlock()
+// 	p.trigger()
+// }
 
 func (p *poller) readWrite(ev *syscall.Kevent_t) {
 	if ev.Flags&syscall.EV_DELETE > 0 {
@@ -138,7 +170,7 @@ func (p *poller) readWrite(ev *syscall.Kevent_t) {
 	fd := int(ev.Ident)
 	c := p.getConn(fd)
 	if c != nil {
-		if ev.Filter&syscall.EVFILT_READ == syscall.EVFILT_READ {
+		if ev.Filter == syscall.EVFILT_READ {
 			if p.g.onRead == nil {
 				for {
 					buffer := p.g.borrow(c)
@@ -147,10 +179,10 @@ func (p *poller) readWrite(ev *syscall.Kevent_t) {
 						p.g.onData(rc, buffer[:n])
 					}
 					p.g.payback(c, buffer)
-					if err == syscall.EINTR {
+					if errors.Is(err, syscall.EINTR) {
 						continue
 					}
-					if err == syscall.EAGAIN {
+					if errors.Is(err, syscall.EAGAIN) {
 						return
 					}
 					if (err != nil || n == 0) && ev.Flags&syscall.EV_DELETE == 0 {
@@ -166,19 +198,32 @@ func (p *poller) readWrite(ev *syscall.Kevent_t) {
 			} else {
 				p.g.onRead(c)
 			}
+
+			if ev.Flags&syscall.EV_EOF != 0 {
+				if c.onConnected == nil {
+					c.flush()
+				} else {
+					c.onConnected(c, nil)
+					c.onConnected = nil
+					c.resetRead()
+				}
+			}
 		}
 
-		if ev.Filter&syscall.EVFILT_WRITE == syscall.EVFILT_WRITE {
-			c.flush()
+		if ev.Filter == syscall.EVFILT_WRITE {
+			if c.onConnected == nil {
+				c.flush()
+			} else {
+				c.resetRead()
+				c.onConnected(c, nil)
+				c.onConnected = nil
+			}
 		}
-	} else {
-		syscall.Close(fd)
-		// p.deleteEvent(fd)
 	}
 }
 
 func (p *poller) start() {
-	if p.g.lockPoller {
+	if p.g.LockPoller {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
@@ -196,7 +241,7 @@ func (p *poller) start() {
 }
 
 func (p *poller) acceptorLoop() {
-	if p.g.lockListener {
+	if p.g.LockListener {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
@@ -205,15 +250,17 @@ func (p *poller) acceptorLoop() {
 	for !p.shutdown {
 		conn, err := p.listener.Accept()
 		if err == nil {
-			c, err := NBConn(conn)
+			var c *Conn
+			c, err = NBConn(conn)
 			if err != nil {
 				conn.Close()
 				continue
 			}
 			p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
 		} else {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				logging.Error("NBIO[%v][%v_%v] Accept failed: temporary error, retrying...", p.g.Name, p.pollType, p.index)
+			var ne net.Error
+			if ok := errors.As(err, &ne); ok && ne.Timeout() {
+				logging.Error("NBIO[%v][%v_%v] Accept failed: timeout error, retrying...", p.g.Name, p.pollType, p.index)
 				time.Sleep(time.Second / 20)
 			} else {
 				if !p.shutdown {
@@ -226,7 +273,7 @@ func (p *poller) acceptorLoop() {
 }
 
 func (p *poller) readWriteLoop() {
-	if p.g.lockPoller {
+	if p.g.LockPoller {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
@@ -241,7 +288,8 @@ func (p *poller) readWriteLoop() {
 		p.eventList = nil
 		p.mux.Unlock()
 		n, err := syscall.Kevent(p.kfd, changes, events, nil)
-		if err != nil && err != syscall.EINTR {
+		if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.EBADF) && !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.EINVAL) {
+			logging.Error("NBIO[%v][%v_%v] Kevent failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
 			return
 		}
 
@@ -269,12 +317,12 @@ func (p *poller) stop() {
 
 func newPoller(g *Engine, isListener bool, index int) (*poller, error) {
 	if isListener {
-		if len(g.addrs) == 0 {
+		if len(g.Addrs) == 0 {
 			panic("invalid listener num")
 		}
 
-		addr := g.addrs[index%len(g.addrs)]
-		ln, err := g.listen(g.network, addr)
+		addr := g.Addrs[index%len(g.Addrs)]
+		ln, err := g.Listen(g.Network, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -286,7 +334,7 @@ func newPoller(g *Engine, isListener bool, index int) (*poller, error) {
 			isListener: isListener,
 			pollType:   "LISTENER",
 		}
-		if g.network == "unix" {
+		if g.Network == "unix" {
 			p.unixSockAddr = addr
 		}
 

@@ -8,6 +8,7 @@
 package nbio
 
 import (
+	"errors"
 	"net"
 	"runtime"
 	"time"
@@ -66,7 +67,7 @@ func (p *poller) readConn(c *Conn) {
 	}
 }
 
-func (p *poller) addConn(c *Conn, virtualUDPConn ...interface{}) error {
+func (p *poller) addConn(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
 	p.g.connsStd[c] = struct{}{}
@@ -74,12 +75,23 @@ func (p *poller) addConn(c *Conn, virtualUDPConn ...interface{}) error {
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
+	} else {
+		p.g.onUDPListen(c)
 	}
 	// should not read udp client from reading udp server conn
 	if c.typ != ConnTypeUDPClientFromRead {
 		go p.readConn(c)
 	}
 
+	return nil
+}
+
+func (p *poller) addDialer(c *Conn) error {
+	c.p = p
+	p.g.mux.Lock()
+	p.g.connsStd[c] = struct{}{}
+	p.g.mux.Unlock()
+	go p.readConn(c)
 	return nil
 }
 
@@ -94,7 +106,7 @@ func (p *poller) deleteConn(c *Conn) {
 }
 
 func (p *poller) start() {
-	if p.g.lockListener {
+	if p.g.LockListener {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
@@ -109,8 +121,9 @@ func (p *poller) start() {
 		for !p.shutdown {
 			err = p.accept()
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Temporary() {
-					logging.Error("NBIO[%v][%v_%v] Accept failed: temporary error, retrying...", p.g.Name, p.pollType, p.index)
+				var ne net.Error
+				if ok := errors.As(err, &ne); ok && ne.Timeout() {
+					logging.Error("NBIO[%v][%v_%v] Accept failed: timeout error, retrying...", p.g.Name, p.pollType, p.index)
 					time.Sleep(time.Second / 20)
 				} else {
 					if !p.shutdown {
@@ -144,8 +157,8 @@ func newPoller(g *Engine, isListener bool, index int) (*poller, error) {
 
 	if isListener {
 		var err error
-		var addr = g.addrs[index%len(g.addrs)]
-		p.listener, err = g.listen(g.network, addr)
+		var addr = g.Addrs[index%len(g.Addrs)]
+		p.listener, err = g.Listen(g.Network, addr)
 		if err != nil {
 			return nil, err
 		}

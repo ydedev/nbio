@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -17,7 +18,6 @@ import (
 	"time"
 
 	"github.com/lesismal/nbio/logging"
-	"github.com/lesismal/nbio/mempool"
 	"github.com/lesismal/nbio/nbhttp"
 )
 
@@ -50,22 +50,26 @@ const (
 
 // Conn .
 type Conn struct {
-	commonFields
+	*commonFields
 	net.Conn
 
 	mux sync.Mutex
 
+	closeErr error
+
 	chSessionInited chan struct{}
 	session         interface{}
 
-	sendQueue     [][]byte
-	sendQueueSize int
-
 	subprotocol string
 
-	closeErr                 error
+	compressionLevel int
+	onClose          func(c *Conn, err error)
+
+	sendQueue                [][]byte
+	sendQueueSize            uint16
 	closed                   bool
 	isClient                 bool
+	enableCompression        bool
 	remoteCompressionEnabled bool
 	enableWriteCompression   bool
 	isBlockingMod            bool
@@ -73,9 +77,16 @@ type Conn struct {
 	isInReadingLoop          bool
 	expectingFragments       bool
 	compress                 bool
-	opcode                   MessageType
-	buffer                   []byte
+	msgType                  MessageType
 	message                  []byte
+	bytesCached              []byte
+
+	Engine  *nbhttp.Engine
+	Execute func(f func()) bool
+}
+
+func (c *Conn) UnderlayerConn() net.Conn {
+	return c.Conn
 }
 
 // IsClient .
@@ -111,9 +122,9 @@ func (c *Conn) Close() error {
 }
 
 // CloseWithError .
-func (c *Conn) CloseWithError(err error) error {
+func (c *Conn) CloseWithError(err error) {
 	c.SetCloseError(err)
-	return c.Close()
+	c.Close()
 }
 
 // SetCloseError .
@@ -130,22 +141,26 @@ func (c *Conn) CompressionEnabled() bool {
 	return c.compress
 }
 
-func (c *Conn) handleDataFrame(p *nbhttp.Parser, opcode MessageType, fin bool, data []byte) {
+func (c *Conn) handleDataFrame(opcode MessageType, fin bool, body []byte) {
 	h := c.dataFrameHandler
 	if c.isBlockingMod {
-		h(c, opcode, fin, data)
+		h(c, opcode, fin, body)
 	} else {
-		p.Execute(func() {
-			h(c, opcode, fin, data)
-		})
+		if !c.Execute(func() {
+			h(c, opcode, fin, body)
+		}) {
+			if len(body) > 0 {
+				c.Engine.BodyAllocator.Free(body)
+			}
+		}
 	}
 }
 
-func (c *Conn) handleMessage(p *nbhttp.Parser, opcode MessageType, body []byte) {
+func (c *Conn) handleMessage(opcode MessageType, body []byte) {
 	if c.isBlockingMod {
 		c.handleWsMessage(opcode, body)
 	} else {
-		if !p.Execute(func() {
+		if !c.Execute(func() {
 			c.handleWsMessage(opcode, body)
 		}) {
 			if len(body) > 0 {
@@ -155,14 +170,14 @@ func (c *Conn) handleMessage(p *nbhttp.Parser, opcode MessageType, body []byte) 
 	}
 }
 
-func (c *Conn) handleProtocolMessage(p *nbhttp.Parser, opcode MessageType, body []byte) {
+func (c *Conn) handleProtocolMessage(opcode MessageType, body []byte) {
 	if c.isBlockingMod {
 		c.handleWsMessage(opcode, body)
 		if len(body) > 0 && c.Engine.ReleaseWebsocketPayload {
 			c.Engine.BodyAllocator.Free(body)
 		}
 	} else {
-		if !p.Execute(func() {
+		if !c.Execute(func() {
 			c.handleWsMessage(opcode, body)
 			if len(body) > 0 && c.Engine.ReleaseWebsocketPayload {
 				c.Engine.BodyAllocator.Free(body)
@@ -248,219 +263,230 @@ ErrExit:
 	c.Close()
 }
 
-func (c *Conn) nextFrame() (opcode MessageType, body []byte, ok, fin, res1, res2, res3 bool, err error) {
-	l := int64(len(c.buffer))
-	headLen := int64(2)
+func (c *Conn) nextFrame(data []byte) ([]byte, MessageType, []byte, bool, bool, bool, error) {
+	var (
+		opcode                    MessageType
+		body                      []byte
+		ok, fin, res1, res2, res3 bool
+		err                       error
+		l                         = int64(len(data))
+		headLen                   = int64(2)
+	)
 	if l >= 2 {
-		opcode = MessageType(c.buffer[0] & 0xF)
-		res1 = int8(c.buffer[0]&0x40) != 0
-		res2 = int8(c.buffer[0]&0x20) != 0
-		res3 = int8(c.buffer[0]&0x10) != 0
-		fin = ((c.buffer[0] & 0x80) != 0)
-		payloadLen := c.buffer[1] & 0x7F
+		opcode = MessageType(data[0] & 0xF)
+		res1 = int8(data[0]&0x40) != 0
+		res2 = int8(data[0]&0x20) != 0
+		res3 = int8(data[0]&0x10) != 0
+		fin = ((data[0] & 0x80) != 0)
+		payloadLen := data[1] & 0x7F
 		bodyLen := int64(-1)
 
 		switch payloadLen {
 		case 126:
 			if l >= 4 {
-				bodyLen = int64(binary.BigEndian.Uint16(c.buffer[2:4]))
+				bodyLen = int64(binary.BigEndian.Uint16(data[2:4]))
 				headLen = 4
 			}
 		case 127:
-			if len(c.buffer) >= 10 {
-				bodyLen = int64(binary.BigEndian.Uint64(c.buffer[2:10]))
+			if len(data) >= 10 {
+				bodyLen = int64(binary.BigEndian.Uint64(data[2:10]))
 				headLen = 10
 			}
 		default:
 			bodyLen = int64(payloadLen)
 		}
 
+		if c.isMessageTooLarge(len(c.message) + int(bodyLen)) {
+			return data, 0, nil, false, false, false, ErrMessageTooLarge
+		}
+
 		if (bodyLen > maxControlFramePayloadSize) &&
 			((opcode == PingMessage) || (opcode == PongMessage) || (opcode == CloseMessage)) {
-			err = ErrControlMessageTooBig
-			return
+			return data, 0, nil, false, false, false, ErrControlMessageTooBig
 		}
 
 		if bodyLen >= 0 {
-			masked := (c.buffer[1] & 0x80) != 0
+			masked := (data[1] & 0x80) != 0
 			if masked {
 				headLen += 4
 			}
 			total := headLen + bodyLen
 			if l >= total {
-				body = c.buffer[headLen:total]
+				body = data[headLen:total]
 				if masked {
-					maskXOR(body, c.buffer[headLen-4:headLen])
+					maskXOR(body, data[headLen-4:headLen])
 				}
 
 				ok = true
-				c.buffer = c.buffer[total:l]
+				data = data[total:l]
+				err = c.validFrame(opcode, fin, res1, res2, res3, c.expectingFragments)
 			}
 		}
 	}
 
-	return opcode, body, ok, fin, res1, res2, res3, err
+	return data, opcode, body, ok, fin, res1, err
 }
 
 // Read .
-func (c *Conn) Read(p *nbhttp.Parser, data []byte) error {
-	oldLen := len(c.buffer)
+func (c *Conn) Parse(data []byte) error {
+	c.mux.Lock()
 	readLimit := c.Engine.ReadLimit
-	if readLimit > 0 && (oldLen+len(data) > readLimit) {
+	if readLimit > 0 && (len(c.bytesCached)+len(data) > readLimit) {
+		c.mux.Unlock()
 		return nbhttp.ErrTooLong
 	}
 
-	var oldBuffer []byte
-	if oldLen == 0 {
-		c.buffer = data
-	} else {
-		c.buffer = mempool.Append(c.buffer, data...)
-		oldBuffer = c.buffer
+	var appended = false
+	var allocator = c.Engine.BodyAllocator
+	if len(c.bytesCached) > 0 {
+		c.bytesCached = allocator.Append(c.bytesCached, data...)
+		data = c.bytesCached
+		appended = true
 	}
+	c.mux.Unlock()
 
 	var err error
+	var body []byte
+	var frame []byte
+	var message []byte
+	var protocolMessage []byte
+	var opcode MessageType
+	var ok, fin, compress bool
 	for !c.closed {
-		opcode, body, ok, fin, res1, res2, res3, e := c.nextFrame()
-		if e != nil {
-			err = e
-			break
-		}
-		if !ok {
-			break
-		}
-		if err = c.validFrame(opcode, fin, res1, res2, res3, c.expectingFragments); err != nil {
-			break
-		}
-		if opcode == FragmentMessage || opcode == TextMessage || opcode == BinaryMessage {
-			if c.opcode == 0 {
-				c.opcode = opcode
-				c.compress = res1
+		func() {
+			c.mux.Lock()
+			defer c.mux.Unlock()
+			data, opcode, body, ok, fin, compress, err = c.nextFrame(data)
+			if err != nil {
+				return
 			}
-			bl := len(body)
-			if c.dataFrameHandler != nil {
-				var frame []byte
-				if bl > 0 {
-					if c.isMessageTooLarge(bl) {
-						err = ErrMessageTooLarge
-						break
-					}
-					frame = c.Engine.BodyAllocator.Malloc(bl)
-					copy(frame, body)
-				}
-				if c.opcode == TextMessage && len(frame) > 0 && !c.Engine.CheckUtf8(frame) {
-					c.Conn.Close()
-				} else {
-					c.handleDataFrame(p, c.opcode, fin, frame)
-				}
+			if !ok {
+				return
 			}
-			if bl > 0 && c.messageHandler != nil {
-				if c.message == nil {
-					if c.isMessageTooLarge(len(body)) {
-						err = ErrMessageTooLarge
-						break
-					}
-					c.message = c.Engine.BodyAllocator.Malloc(len(body))
-					copy(c.message, body)
-				} else {
-					if c.isMessageTooLarge(len(c.message) + len(body)) {
-						err = ErrMessageTooLarge
-						break
-					}
-					c.message = c.Engine.BodyAllocator.Append(c.message, body...)
+
+			switch opcode {
+			case FragmentMessage, TextMessage, BinaryMessage:
+				if c.msgType == 0 {
+					c.msgType = opcode
+					c.compress = compress
 				}
-			}
-			if fin {
+				bl := len(body)
+				if c.dataFrameHandler != nil {
+					if bl > 0 {
+						frame = allocator.Malloc(bl)
+						copy(frame, body)
+					}
+					if c.msgType == TextMessage && len(frame) > 0 && !c.Engine.CheckUtf8(frame) {
+						c.Conn.Close()
+						err = ErrInvalidUtf8
+						return
+					}
+				}
 				if c.messageHandler != nil {
-					if c.compress {
-						var b []byte
-						var rc io.ReadCloser
-						if c.Engine.WebsocketDecompressor != nil {
-							rc = c.Engine.WebsocketDecompressor(io.MultiReader(bytes.NewBuffer(c.message), strings.NewReader(flateReaderTail)))
+					if bl > 0 {
+						if c.message == nil {
+							c.message = allocator.Malloc(len(body))
+							copy(c.message, body)
 						} else {
-							rc = decompressReader(io.MultiReader(bytes.NewBuffer(c.message), strings.NewReader(flateReaderTail)))
-						}
-						b, err = c.readAll(rc, len(c.message)*2)
-						c.Engine.BodyAllocator.Free(c.message)
-						c.message = b
-						rc.Close()
-						if err != nil {
-							break
+							c.message = allocator.Append(c.message, body...)
 						}
 					}
-					c.handleMessage(p, c.opcode, c.message)
+					if fin {
+						message = c.message
+						c.message = nil
+					}
 				}
-				c.compress = false
-				c.expectingFragments = false
-				c.message = nil
-				c.opcode = 0
-			} else {
-				c.expectingFragments = true
-			}
-		} else {
-			var frame []byte
-			if len(body) > 0 {
-				if c.isMessageTooLarge(len(body)) {
-					err = ErrMessageTooLarge
-					break
+			case PingMessage, PongMessage, CloseMessage:
+				if len(body) > 0 {
+					protocolMessage = allocator.Malloc(len(body))
+					copy(protocolMessage, body)
 				}
-				frame = c.Engine.BodyAllocator.Malloc(len(body))
-				copy(frame, body)
+			default:
+				err = ErrInvalidFragmentMessage
+				return
 			}
-			c.handleProtocolMessage(p, opcode, frame)
+		}()
+
+		if err != nil {
+			if errors.Is(err, ErrMessageTooLarge) || errors.Is(err, ErrControlMessageTooBig) {
+				c.WriteClose(1009, err.Error())
+			}
+			return err
 		}
 
-		if len(c.buffer) == 0 {
-			break
+		if ok {
+			switch opcode {
+			case FragmentMessage, TextMessage, BinaryMessage:
+				if c.dataFrameHandler != nil {
+					c.handleDataFrame(c.msgType, fin, frame)
+				}
+				if fin {
+					if c.messageHandler != nil {
+						if c.compress {
+							var b []byte
+							var rc io.ReadCloser
+							if c.Engine.WebsocketDecompressor != nil {
+								rc = c.Engine.WebsocketDecompressor(io.MultiReader(bytes.NewBuffer(message), strings.NewReader(flateReaderTail)))
+							} else {
+								rc = decompressReader(io.MultiReader(bytes.NewBuffer(message), strings.NewReader(flateReaderTail)))
+							}
+							b, err = c.readAll(rc, len(message)*2)
+							allocator.Free(message)
+							message = b
+							rc.Close()
+							if err != nil {
+								return err
+							}
+						}
+						c.handleMessage(c.msgType, message)
+					}
+					c.compress = false
+					c.expectingFragments = false
+					message = nil
+					c.msgType = 0
+				} else {
+					c.expectingFragments = true
+				}
+			case PingMessage, PongMessage, CloseMessage:
+				c.handleProtocolMessage(opcode, protocolMessage)
+			default:
+				return ErrInvalidFragmentMessage
+			}
+		} else {
+			goto Exit
+		}
+
+		if len(data) == 0 {
+			goto Exit
 		}
 	}
 
-	if oldLen == 0 {
-		if len(c.buffer) > 0 {
-			tmp := c.buffer
-			c.buffer = mempool.Malloc(len(tmp))
-			copy(c.buffer, tmp)
-		} else {
-			c.buffer = nil
+Exit:
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	// The data bytes were not all consumed, need to recache the current bytes left:
+	if len(data) > 0 {
+		// The data bytes were appended to the tail of the previous chaced data:
+		if appended {
+			// If data bytes were consumed, move data to the head of the cached bytes,
+			// else the data is same as the cached bytes, nothing to do.
+			if len(data) < len(c.bytesCached) {
+				c.bytesCached = c.bytesCached[:len(data)]
+				copy(c.bytesCached, data)
+			}
+		} else { // When using the origin data passed to this `Parse` func:
+			c.bytesCached = allocator.Malloc(len(data))
+			copy(c.bytesCached, data)
 		}
-	} else {
-		if len(c.buffer) == 0 {
-			mempool.Free(oldBuffer)
-			c.buffer = nil
-		} else if len(c.buffer) < len(oldBuffer) {
-			tmp := mempool.Malloc(len(c.buffer))
-			copy(tmp, c.buffer)
-			c.buffer = tmp
-			mempool.Free(oldBuffer)
+	} else { // The data bytes were all consumed:
+		// If the data bytes were cached, release the bytes and clear the cache.
+		if len(c.bytesCached) > 0 {
+			allocator.Free(c.bytesCached)
+			c.bytesCached = nil
 		}
 	}
 
 	return err
-}
-
-// SetCloseHandler .
-func (c *Conn) SetCloseHandler(h func(*Conn, int, string)) {
-	if h != nil {
-		c.closeMessageHandler = h
-	}
-}
-
-// SetPingHandler .
-func (c *Conn) SetPingHandler(h func(*Conn, string)) {
-	if h != nil {
-		c.pingMessageHandler = h
-	}
-}
-
-// SetPongHandler .
-func (c *Conn) SetPongHandler(h func(*Conn, string)) {
-	if h != nil {
-		c.pongMessageHandler = h
-	}
-}
-
-// OnOpen .
-func (c *Conn) OnOpen(h func(*Conn)) {
-	c.openHandler = h
 }
 
 // OnMessage .
@@ -508,6 +534,13 @@ func (c *Conn) WriteClose(code int, reason string) error {
 
 // WriteMessage .
 func (c *Conn) WriteMessage(messageType MessageType, data []byte) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	if c.closed {
+		return net.ErrClosed
+	}
+
 	switch messageType {
 	case TextMessage:
 	case BinaryMessage:
@@ -521,11 +554,9 @@ func (c *Conn) WriteMessage(messageType MessageType, data []byte) error {
 
 	compress := c.enableWriteCompression && (messageType == TextMessage || messageType == BinaryMessage)
 	if compress {
-		// compress = true
-		// if user customize mempool, they should promise it's safe to mempool.Free a buffer which is not from their mempool.Malloc
-		// or we need to implement a writebuffer that use mempool.Realloc to grow or append the buffer
 		w := &writeBuffer{
-			Buffer: bytes.NewBuffer(mempool.Malloc(len(data))),
+			free:   c.Engine.BodyAllocator.Free,
+			Buffer: bytes.NewBuffer(c.Engine.BodyAllocator.Malloc(len(data))),
 		}
 		defer w.Close()
 		w.Reset()
@@ -567,7 +598,10 @@ func (c *Conn) WriteMessage(messageType MessageType, data []byte) error {
 
 // Session returns user session.
 func (c *Conn) Session() interface{} {
-	return c.session
+	if c.chSessionInited == nil {
+		return c.session
+	}
+	return c.SessionWithLock()
 }
 
 // SessionWithLock returns user session with lock, returns as soon as the session has been seted.
@@ -600,71 +634,80 @@ func (c *Conn) SessionWithContext(ctx context.Context) interface{} {
 // SetSession sets user session.
 func (c *Conn) SetSession(session interface{}) {
 	c.mux.Lock()
+	c.session = session
 	if c.chSessionInited != nil {
 		close(c.chSessionInited)
 		c.chSessionInited = nil
 	}
 	c.mux.Unlock()
-	c.session = session
 }
 
 type writeBuffer struct {
 	*bytes.Buffer
+	free func([]byte)
 }
 
 // Close .
 func (w *writeBuffer) Close() error {
-	mempool.Free(w.Bytes())
+	w.free(w.Bytes())
 	return nil
 }
 
 // CloseAndClean .
 func (c *Conn) CloseAndClean(err error) {
 	c.mux.Lock()
+	if c.closed {
+		c.mux.Unlock()
+		return
+	}
+
+	c.closed = true
+
 	if c.chSessionInited != nil {
 		close(c.chSessionInited)
 		c.chSessionInited = nil
 	}
 
-	closed := c.closed
-	c.closed = true
-	if closed {
-		c.mux.Unlock()
-		return
-	} else {
-		for i, b := range c.sendQueue {
-			if b != nil {
-				mempool.Free(b)
-				c.sendQueue[i] = nil
-			}
-		}
-
-		if c.closeErr == nil {
-			c.closeErr = err
+	for i, b := range c.sendQueue {
+		if b != nil {
+			c.Engine.BodyAllocator.Free(b)
+			c.sendQueue[i] = nil
 		}
 	}
-	c.mux.Unlock()
+
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
 
 	if c.Conn != nil {
 		c.Conn.Close()
 	}
 
-	if c.onClose != nil {
-		c.onClose(c, c.closeErr)
-	}
-
-	if c.buffer != nil {
-		mempool.Free(c.buffer)
-		c.buffer = nil
+	if c.bytesCached != nil {
+		c.Engine.BodyAllocator.Free(c.bytesCached)
+		c.bytesCached = nil
 	}
 	if c.message != nil {
-		mempool.Free(c.message)
+		c.Engine.BodyAllocator.Free(c.message)
 		c.message = nil
+	}
+
+	c.mux.Unlock()
+
+	if c.onClose != nil {
+		c.onClose(c, c.closeErr)
 	}
 }
 
 // WriteFrame .
 func (c *Conn) WriteFrame(messageType MessageType, sendOpcode, fin bool, data []byte) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	if c.closed {
+		return net.ErrClosed
+	}
+
 	return c.writeFrame(messageType, sendOpcode, fin, data, false)
 }
 
@@ -684,18 +727,18 @@ func (c *Conn) writeFrame(messageType MessageType, sendOpcode, fin bool, data []
 
 	if bodyLen < 126 {
 		headLen = 2 + maskLen
-		buf = mempool.Malloc(len(data) + headLen)
+		buf = c.Engine.BodyAllocator.Malloc(len(data) + headLen)
 		buf[0] = 0
 		buf[1] = (byte1 | byte(bodyLen))
 	} else if bodyLen <= 65535 {
 		headLen = 4 + maskLen
-		buf = mempool.Malloc(len(data) + headLen)
+		buf = c.Engine.BodyAllocator.Malloc(len(data) + headLen)
 		buf[0] = 0
 		buf[1] = (byte1 | 126)
 		binary.BigEndian.PutUint16(buf[2:4], uint16(bodyLen))
 	} else {
 		headLen = 10 + maskLen
-		buf = mempool.Malloc(len(data) + headLen)
+		buf = c.Engine.BodyAllocator.Malloc(len(data) + headLen)
 		buf[0] = 0
 		buf[1] = (byte1 | 127)
 		binary.BigEndian.PutUint64(buf[2:10], uint64(bodyLen))
@@ -726,17 +769,9 @@ func (c *Conn) writeFrame(messageType MessageType, sendOpcode, fin bool, data []
 		buf[0] |= byte(0x80)
 	}
 
-	c.mux.Lock()
-	if c.closed {
-		c.mux.Unlock()
-		mempool.Free(buf)
-		return net.ErrClosed
-	}
-
 	if c.sendQueue != nil {
-		if c.sendQueueSize > 0 && len(c.sendQueue) >= c.sendQueueSize {
-			c.mux.Unlock()
-			mempool.Free(buf)
+		if c.sendQueueSize > 0 && len(c.sendQueue) >= int(c.sendQueueSize) {
+			c.Engine.BodyAllocator.Free(buf)
 			return ErrMessageSendQuqueIsFull
 		}
 		c.sendQueue = append(c.sendQueue, buf)
@@ -744,14 +779,13 @@ func (c *Conn) writeFrame(messageType MessageType, sendOpcode, fin bool, data []
 		if isHead {
 			c.sendQueue[0] = nil
 		}
-		c.mux.Unlock()
 
 		if isHead {
 			go func() {
 				i := 0
 				for {
 					_, err := c.Conn.Write(buf)
-					mempool.Free(buf)
+					c.Engine.BodyAllocator.Free(buf)
 					if err != nil {
 						c.CloseWithError(err)
 						return
@@ -782,10 +816,9 @@ func (c *Conn) writeFrame(messageType MessageType, sendOpcode, fin bool, data []
 		}
 		return nil
 	}
-	c.mux.Unlock()
 
 	_, err := c.Conn.Write(buf)
-	mempool.Free(buf)
+	c.Engine.BodyAllocator.Free(buf)
 
 	return err
 }
@@ -811,12 +844,25 @@ func (c *Conn) Subprotocol() string {
 	return c.subprotocol
 }
 
-func NewConn(u *Upgrader, c net.Conn, subprotocol string, remoteCompressionEnabled bool, asyncWrite bool) *Conn {
+func NewClientConn(opt *Options, c net.Conn, subprotocol string, remoteCompressionEnabled bool, asyncWrite bool) *Conn {
+	return newConn(opt, c, subprotocol, remoteCompressionEnabled, asyncWrite, true)
+}
+
+func NewServerConn(u *Upgrader, c net.Conn, subprotocol string, remoteCompressionEnabled bool, asyncWrite bool) *Conn {
+	return newConn(u, c, subprotocol, remoteCompressionEnabled, asyncWrite, false)
+}
+
+func newConn(u *Upgrader, c net.Conn, subprotocol string, remoteCompressionEnabled bool, asyncWrite bool, isClient bool) *Conn {
 	wsc := &Conn{
-		commonFields:             u.commonFields,
+		commonFields:             &u.commonFields,
+		Engine:                   u.Engine,
 		Conn:                     c,
 		subprotocol:              subprotocol,
+		enableCompression:        u.enableCompression,
 		remoteCompressionEnabled: remoteCompressionEnabled,
+		compressionLevel:         u.compressionLevel,
+		onClose:                  u.onClose,
+		isClient:                 isClient,
 	}
 	wsc.EnableWriteCompression(remoteCompressionEnabled)
 	if asyncWrite {
@@ -862,7 +908,7 @@ func (c *Conn) HandleRead(bufSize int) {
 		if err != nil {
 			break
 		}
-		err = c.Read(nil, buf[:n])
+		err = c.Parse(buf[:n])
 		if err != nil {
 			break
 		}
@@ -871,8 +917,8 @@ func (c *Conn) HandleRead(bufSize int) {
 
 // return false if length is ok.
 func (c *Conn) isMessageTooLarge(len int) bool {
-	if c.MessageLengthLimit == 0 {
-		// 0 means unlimitted size
+	// <=0 means unlimitted size
+	if c.MessageLengthLimit <= 0 {
 		return false
 	}
 	return len > c.MessageLengthLimit
@@ -886,19 +932,22 @@ func (c *Conn) validFrame(opcode MessageType, fin, res1, res2, res3, expectingFr
 		return ErrReserveBitSet
 	}
 	if opcode > BinaryMessage && opcode < CloseMessage {
-		return fmt.Errorf("%w: opcode=%d", ErrReservedOpcodeSet, opcode)
+		return fmt.Errorf("%w: opcode=%d", ErrReservedMessageType, opcode)
 	}
 	if !fin && (opcode != FragmentMessage && opcode != TextMessage && opcode != BinaryMessage) {
 		return fmt.Errorf("%w: opcode=%d", ErrControlMessageFragmented, opcode)
 	}
 	if expectingFragments && (opcode == TextMessage || opcode == BinaryMessage) {
-		return ErrFragmentsShouldNotHaveBinaryOrTextOpcode
+		return ErrFragmentsShouldNotHaveBinaryOrTextMessage
 	}
 	return nil
 }
 
 func (c *Conn) readAll(r io.Reader, size int) ([]byte, error) {
 	const maxAppendSize = 1024 * 1024 * 4
+	if c.MessageLengthLimit > 0 && size > c.MessageLengthLimit {
+		size = c.MessageLengthLimit
+	}
 	buf := c.Engine.BodyAllocator.Malloc(size)[0:0]
 	for {
 		n, err := r.Read(buf[len(buf):cap(buf)])
@@ -913,9 +962,17 @@ func (c *Conn) readAll(r io.Reader, size int) ([]byte, error) {
 		}
 		if len(buf) == cap(buf) {
 			l := len(buf)
+			// can not extend more bytes.
+			if c.isMessageTooLarge(l + 1) {
+				return nil, ErrMessageTooLarge
+			}
 			al := l
 			if al > maxAppendSize {
 				al = maxAppendSize
+			}
+			// extend to the limit size at most.
+			if (c.MessageLengthLimit > 0) && (l+al > c.MessageLengthLimit) {
+				al = c.MessageLengthLimit - l
 			}
 			buf = c.Engine.BodyAllocator.Append(buf, make([]byte, al)...)[:l]
 		}
