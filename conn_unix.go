@@ -96,6 +96,7 @@ type toWrite struct {
 
 // Conn implements net.Conn with non-blocking interfaces.
 type Conn struct {
+	Unix int64
 	mux sync.Mutex
 
 	// the poller that handles io events for this connection.
