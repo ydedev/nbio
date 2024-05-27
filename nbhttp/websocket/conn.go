@@ -52,8 +52,8 @@ const (
 type Conn struct {
 	*commonFields
 	net.Conn
-
-	mux sync.Mutex
+	Unix int64
+	mux  sync.Mutex
 
 	closeErr error
 
