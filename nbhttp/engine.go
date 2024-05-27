@@ -107,7 +107,7 @@ type Config struct {
 	// NListener represents listner goroutine num for each ConfAddr, it's set to 1 by default.
 	NListener int
 
-	// NPoller represents poller goroutine num, it's set to runtime.NumCPU() by default.
+	// NPoller represents poller goroutine num.
 	NPoller int
 
 	// ReadLimit represents the max size for parser reading, it's set to 64M by default.
@@ -119,8 +119,8 @@ type Config struct {
 	// ReadBufferSize represents buffer size for reading, it's set to 64k by default.
 	ReadBufferSize int
 
-	// MaxWriteBufferSize represents max write buffer size for Conn, it's set to 1m by default.
-	// if the connection's Send-Q is full and the data cached by nbio is
+	// MaxWriteBufferSize represents max write buffer size for Conn, 0 by default, represents no limit for writeBuffer
+	// if MaxWriteBufferSize is set greater than to 0, and the connection's Send-Q is full and the data cached by nbio is
 	// more than MaxWriteBufferSize, the connection would be closed by nbio.
 	MaxWriteBufferSize int
 
@@ -196,9 +196,11 @@ type Config struct {
 	// ReadBufferPool .
 	ReadBufferPool mempool.Allocator
 
+	// Deprecated.
 	// WebsocketCompressor .
 	WebsocketCompressor func(w io.WriteCloser, level int) io.WriteCloser
 
+	// Deprecated.
 	// WebsocketDecompressor .
 	WebsocketDecompressor func(r io.Reader) io.ReadCloser
 
@@ -439,7 +441,10 @@ func (e *Engine) SetETAsyncRead() {
 // SetLTSyncRead .
 func (e *Engine) SetLTSyncRead() {
 	if e.NPoller <= 0 {
-		e.NPoller = runtime.NumCPU()
+		e.NPoller = runtime.NumCPU() / 4
+		if e.NPoller == 0 {
+			e.NPoller = 1
+		}
 	}
 	e.EpollMod = nbio.EPOLLLT
 	e.AsyncReadInPoller = false
@@ -603,8 +608,14 @@ func (engine *Engine) AddTransferredConn(nbc *nbio.Conn) error {
 	}
 	engine.conns[key] = struct{}{}
 	engine.mux.Unlock()
+	_, err = engine.AddConn(nbc)
+	if err != nil {
+		engine.mux.Lock()
+		delete(engine.conns, key)
+		engine.mux.Unlock()
+		return err
+	}
 	engine._onOpen(nbc)
-	engine.AddConn(nbc)
 	return nil
 }
 
@@ -651,7 +662,13 @@ func (engine *Engine) AddConnNonTLSNonBlocking(conn *Conn, tlsConfig *tls.Config
 	conn.Parser = parser
 	nbc.SetSession(parser)
 	nbc.OnData(engine.DataHandler)
-	engine.AddConn(nbc)
+	_, err = engine.AddConn(nbc)
+	if err != nil {
+		engine.mux.Lock()
+		delete(engine.conns, key)
+		engine.mux.Unlock()
+		return
+	}
 	nbc.SetReadDeadline(time.Now().Add(engine.KeepaliveTime))
 }
 
@@ -745,7 +762,12 @@ func (engine *Engine) AddConnTLSNonBlocking(conn *Conn, tlsConfig *tls.Config, d
 	nbc.SetSession(parser)
 
 	nbc.OnData(engine.TLSDataHandler)
-	engine.AddConn(nbc)
+	_, err = engine.AddConn(nbc)
+	if err != nil {
+		engine.mux.Lock()
+		delete(engine.conns, key)
+		engine.mux.Unlock()
+	}
 	nbc.SetReadDeadline(time.Now().Add(engine.KeepaliveTime))
 }
 

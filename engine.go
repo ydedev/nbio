@@ -23,7 +23,7 @@ const (
 	DefaultReadBufferSize = 1024 * 64
 
 	// DefaultMaxWriteBufferSize .
-	DefaultMaxWriteBufferSize = 1024 * 1024
+	DefaultMaxWriteBufferSize = 0
 
 	// DefaultMaxConnReadTimesPerEventLoop .
 	DefaultMaxConnReadTimesPerEventLoop = 3
@@ -55,22 +55,20 @@ type Config struct {
 	Name string
 
 	// Network is the listening protocol, used with Addrs together.
-	// tcp* supported only by now, there's no plan for other protocol such as udp,
-	// because it's too easy to write udp server/client.
 	Network string
 
 	// Addrs is the listening addr list for a nbio server.
 	// if it is empty, no listener created, then the Engine is used for client by default.
 	Addrs []string
 
-	// NPoller represents poller goroutine num, it's set to runtime.NumCPU() by default.
+	// NPoller represents poller goroutine num.
 	NPoller int
 
 	// ReadBufferSize represents buffer size for reading, it's set to 64k by default.
 	ReadBufferSize int
 
-	// MaxWriteBufferSize represents max write buffer size for Conn, it's set to 1m by default.
-	// if the connection's Send-Q is full and the data cached by nbio is
+	// MaxWriteBufferSize represents max write buffer size for Conn, 0 by default, represents no limit for writeBuffer
+	// if MaxWriteBufferSize is set greater than to 0, and the connection's Send-Q is full and the data cached by nbio is
 	// more than MaxWriteBufferSize, the connection would be closed by nbio.
 	MaxWriteBufferSize int
 
@@ -102,7 +100,7 @@ type Config struct {
 	// AsyncReadInPoller represents how the reading events and reading are handled
 	// by epoll goroutine:
 	// true : epoll goroutine handles the reading events only, another goroutine
-	//        pool will handles the reading.
+	//        pool will handle the reading.
 	// false: epoll goroutine handles both the reading events and the reading.
 	AsyncReadInPoller bool
 	// IOExecute is used to handle the aysnc reading, users can customize it.
@@ -219,7 +217,6 @@ func (g *Engine) Stop() {
 	}
 
 	g.wgConn.Wait()
-	time.Sleep(time.Second / 5)
 
 	g.onStop()
 

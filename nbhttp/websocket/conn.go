@@ -173,13 +173,13 @@ func (c *Conn) handleMessage(opcode MessageType, body []byte) {
 func (c *Conn) handleProtocolMessage(opcode MessageType, body []byte) {
 	if c.isBlockingMod {
 		c.handleWsMessage(opcode, body)
-		if len(body) > 0 && c.Engine.ReleaseWebsocketPayload {
+		if len(body) > 0 && c.ReleasePayload {
 			c.Engine.BodyAllocator.Free(body)
 		}
 	} else {
 		if !c.Execute(func() {
 			c.handleWsMessage(opcode, body)
-			if len(body) > 0 && c.Engine.ReleaseWebsocketPayload {
+			if len(body) > 0 && c.ReleasePayload {
 				c.Engine.BodyAllocator.Free(body)
 			}
 		}) {
@@ -330,6 +330,11 @@ func (c *Conn) nextFrame(data []byte) ([]byte, MessageType, []byte, bool, bool, 
 // Read .
 func (c *Conn) Parse(data []byte) error {
 	c.mux.Lock()
+	if c.closed {
+		c.mux.Unlock()
+		return net.ErrClosed
+	}
+
 	readLimit := c.Engine.ReadLimit
 	if readLimit > 0 && (len(c.bytesCached)+len(data) > readLimit) {
 		c.mux.Unlock()
@@ -352,10 +357,27 @@ func (c *Conn) Parse(data []byte) error {
 	var protocolMessage []byte
 	var opcode MessageType
 	var ok, fin, compress bool
+
+	releaseBuf := func() {
+		if len(frame) > 0 {
+			allocator.Free(frame)
+		}
+		if len(message) > 0 {
+			allocator.Free(message)
+		}
+		if len(protocolMessage) > 0 {
+			allocator.Free(protocolMessage)
+		}
+	}
+
 	for !c.closed {
 		func() {
 			c.mux.Lock()
 			defer c.mux.Unlock()
+			if c.closed {
+				err = net.ErrClosed
+				return
+			}
 			data, opcode, body, ok, fin, compress, err = c.nextFrame(data)
 			if err != nil {
 				return
@@ -408,6 +430,7 @@ func (c *Conn) Parse(data []byte) error {
 		}()
 
 		if err != nil {
+			releaseBuf()
 			if errors.Is(err, ErrMessageTooLarge) || errors.Is(err, ErrControlMessageTooBig) {
 				c.WriteClose(1009, err.Error())
 			}
@@ -419,14 +442,15 @@ func (c *Conn) Parse(data []byte) error {
 			case FragmentMessage, TextMessage, BinaryMessage:
 				if c.dataFrameHandler != nil {
 					c.handleDataFrame(c.msgType, fin, frame)
+					frame = nil
 				}
 				if fin {
 					if c.messageHandler != nil {
 						if c.compress {
 							var b []byte
 							var rc io.ReadCloser
-							if c.Engine.WebsocketDecompressor != nil {
-								rc = c.Engine.WebsocketDecompressor(io.MultiReader(bytes.NewBuffer(message), strings.NewReader(flateReaderTail)))
+							if c.WebsocketDecompressor != nil {
+								rc = c.WebsocketDecompressor(c, io.MultiReader(bytes.NewBuffer(message), strings.NewReader(flateReaderTail)))
 							} else {
 								rc = decompressReader(io.MultiReader(bytes.NewBuffer(message), strings.NewReader(flateReaderTail)))
 							}
@@ -435,21 +459,24 @@ func (c *Conn) Parse(data []byte) error {
 							message = b
 							rc.Close()
 							if err != nil {
+								releaseBuf()
 								return err
 							}
 						}
 						c.handleMessage(c.msgType, message)
+						message = nil
 					}
 					c.compress = false
 					c.expectingFragments = false
-					message = nil
 					c.msgType = 0
 				} else {
 					c.expectingFragments = true
 				}
 			case PingMessage, PongMessage, CloseMessage:
 				c.handleProtocolMessage(opcode, protocolMessage)
+				protocolMessage = nil
 			default:
+				releaseBuf()
 				return ErrInvalidFragmentMessage
 			}
 		} else {
@@ -462,8 +489,12 @@ func (c *Conn) Parse(data []byte) error {
 	}
 
 Exit:
+	releaseBuf()
 	c.mux.Lock()
 	defer c.mux.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
 	// The data bytes were not all consumed, need to recache the current bytes left:
 	if len(data) > 0 {
 		// The data bytes were appended to the tail of the previous chaced data:
@@ -493,7 +524,7 @@ Exit:
 func (c *Conn) OnMessage(h func(*Conn, MessageType, []byte)) {
 	if h != nil {
 		c.messageHandler = func(c *Conn, messageType MessageType, data []byte) {
-			if c.Engine.ReleaseWebsocketPayload && len(data) > 0 {
+			if c.ReleasePayload && len(data) > 0 {
 				defer c.Engine.BodyAllocator.Free(data)
 			}
 			if !c.closed {
@@ -507,7 +538,7 @@ func (c *Conn) OnMessage(h func(*Conn, MessageType, []byte)) {
 func (c *Conn) OnDataFrame(h func(*Conn, MessageType, bool, []byte)) {
 	if h != nil {
 		c.dataFrameHandler = func(c *Conn, messageType MessageType, fin bool, data []byte) {
-			if c.Engine.ReleaseWebsocketPayload {
+			if c.ReleasePayload {
 				defer c.Engine.BodyAllocator.Free(data)
 			}
 			h(c, messageType, fin, data)
@@ -562,8 +593,8 @@ func (c *Conn) WriteMessage(messageType MessageType, data []byte) error {
 		w.Reset()
 
 		var cw io.WriteCloser
-		if c.Engine.WebsocketCompressor != nil {
-			cw = c.Engine.WebsocketCompressor(w, c.compressionLevel)
+		if c.WebsocketCompressor != nil {
+			cw = c.WebsocketCompressor(c, w, c.compressionLevel)
 		} else {
 			cw = compressWriter(w, c.compressionLevel)
 		}

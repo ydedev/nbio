@@ -58,6 +58,10 @@ type commonFields struct {
 	MessageLengthLimit         int
 	BlockingModAsyncCloseDelay time.Duration
 
+	ReleasePayload        bool
+	WebsocketCompressor   func(c *Conn, w io.WriteCloser, level int) io.WriteCloser
+	WebsocketDecompressor func(c *Conn, r io.Reader) io.ReadCloser
+
 	pingMessageHandler  func(c *Conn, appData string)
 	pongMessageHandler  func(c *Conn, appData string)
 	closeMessageHandler func(c *Conn, code int, text string)
@@ -222,7 +226,7 @@ func (u *Upgrader) OnOpen(h func(*Conn)) {
 func (u *Upgrader) OnMessage(h func(*Conn, MessageType, []byte)) {
 	if h != nil {
 		u.messageHandler = func(c *Conn, messageType MessageType, data []byte) {
-			if c.Engine.ReleaseWebsocketPayload && len(data) > 0 {
+			if c.ReleasePayload && len(data) > 0 {
 				defer c.Engine.BodyAllocator.Free(data)
 			}
 			if !c.closed {
@@ -236,7 +240,7 @@ func (u *Upgrader) OnMessage(h func(*Conn, MessageType, []byte)) {
 func (u *Upgrader) OnDataFrame(h func(*Conn, MessageType, bool, []byte)) {
 	if h != nil {
 		u.dataFrameHandler = func(c *Conn, messageType MessageType, fin bool, data []byte) {
-			if c.Engine.ReleaseWebsocketPayload {
+			if c.ReleasePayload {
 				defer c.Engine.BodyAllocator.Free(data)
 			}
 			h(c, messageType, fin, data)
@@ -515,6 +519,10 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 			wsc.chSessionInited = make(chan struct{})
 			go wsc.HandleRead(u.BlockingModReadBufferSize)
 		}
+	}
+
+	if !wsc.ReleasePayload {
+		wsc.ReleasePayload = wsc.Engine.ReleaseWebsocketPayload
 	}
 
 	return wsc, nil
